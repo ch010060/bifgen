@@ -55,7 +55,7 @@ def extract_images(metadata, directory, args):
             pos = args.offset + (img_count * args.interval)
             vcap.set(cv2.CAP_PROP_POS_MSEC, pos * 1000)
             if not args.silent:
-                print('\b' * len(msg) + '\x1B[K', end='')
+                #print('\b' * len(msg) + '\x1B[K', end='')
                 if not msg == '[{0}%]'.format(int(100 * pos / metadata['duration'])):
                     msg = '[{0}%]'.format(int(100 * pos / metadata['duration']))
                     print(msg, end='', flush=True)
@@ -73,7 +73,7 @@ def extract_images(metadata, directory, args):
                     print('could not finish generating bif file.')
                 exit(1)
         if not args.silent:
-            print('\b' * len(msg) + '\x1B[K', end='')
+            #print('\b' * len(msg) + '\x1B[K', end='')
             print('done ({0} images)'.format(img_count))
 
 def assemble_bif(output_location, img_directory, args):
@@ -98,7 +98,7 @@ def assemble_bif(output_location, img_directory, args):
 
         for n in range(len(images)):
             if not args.silent:
-                print('\b' * len(msg) + '\x1B[K', end='')
+                #print('\b' * len(msg) + '\x1B[K', end='')
                 msg = '[{0}%]'.format(int(50 * n / len(images)))
                 print(msg, end='', flush=True)
 
@@ -112,7 +112,7 @@ def assemble_bif(output_location, img_directory, args):
 
         for n in range(len(images)):
             if not args.silent:
-                print('\b' * len(msg) + '\x1B[K', end='')
+                #print('\b' * len(msg) + '\x1B[K', end='')
                 msg = '[{0}%]'.format(50 + int(50 * n / len(images)))
                 print(msg, end='', flush=True)
 
@@ -120,8 +120,8 @@ def assemble_bif(output_location, img_directory, args):
             f.write(data)
 
         if not args.silent:
-            print('\b' * len(msg) + '\x1B[K', end='')
-            print('done')
+            #print('\b' * len(msg) + '\x1B[K', end='')
+            print('done\n')
 
 parser = ArgumentParser(description='''generate bif files in order to enable/support
                         positional trickplay thumbnails on roku devices.''')
@@ -140,6 +140,7 @@ parser.add_argument('-s', '--silent', dest='silent', action='store_const', const
 args = parser.parse_args()
 
 success, metadata = get_metadata(args.filepath)
+print(metadata)
 if not success:
     print('error: invalid or corrupt video file')
     exit(1)
