@@ -7,7 +7,13 @@ foreach ($file in $files)
     $filenameBase = $file.basename
     $filenameFull = $file.fullname.replace("\","/")
     $filedir = $file.DirectoryName
-    echo "($counter/$totalNum) $filenameFull" 
-    python3 bifgen.py -o "${filedir}\${filenameBase}-320-10.bif" "${filenameFull}"
+    $BIF_PATH = "${filedir}\${filenameBase}-320-10.bif"
+    echo "($counter/$totalNum) $filenameFull"
+    if(Test-Path -Path $BIF_PATH -PathType Leaf){
+        echo "BIF file does exist, skip !"
+    }
+    else {
+        python3 bifgen.py -o $BIF_PATH "${filenameFull}"
+    }
     $counter++
 }
