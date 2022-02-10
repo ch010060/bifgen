@@ -11,6 +11,29 @@ from PIL import Image
 
 modes = {'sd': (240,136), 'hd': (320,180)}
 
+# Print iterations progress
+def printProgressBar (iteration, total, prefix = '', suffix = '', decimals = 1, length = 100, fill = '█', printEnd = "\r"):
+    """
+    Call in a loop to create terminal progress bar
+    @params:
+        iteration   - Required  : current iteration (Int)
+        total       - Required  : total iterations (Int)
+        prefix      - Optional  : prefix string (Str)
+        suffix      - Optional  : suffix string (Str)
+        decimals    - Optional  : positive number of decimals in percent complete (Int)
+        length      - Optional  : character length of bar (Int)
+        fill        - Optional  : bar fill character (Str)
+        printEnd    - Optional  : end character (e.g. "\r", "\r\n") (Str)
+    """
+    percent = ("{0:." + str(decimals) + "f}").format(100 * (iteration / float(total)))
+    filledLength = int(length * iteration // total)
+    bar = fill * filledLength + '-' * (length - filledLength)
+    print(f'\r{prefix} |{bar}| {percent}% {suffix}', end = printEnd)
+    sys.stdout.flush()
+    # Print New Line on Complete
+    if iteration == total: 
+        print()
+
 def human_duration(t):
     dur = []
     while t and len(dur) < 3:
@@ -51,14 +74,16 @@ def extract_images(metadata, directory, args):
         if not args.silent:
             print('extracting images... ', end='', flush=True)
             msg = ''
+        # Initial call to print 0% progress
+        printProgressBar(0, 100, prefix = 'Progress:', suffix = '', length = 100)
         while (args.offset + (img_count * args.interval)) * 1000 < metadata['duration_ms']:
             pos = args.offset + (img_count * args.interval)
             vcap.set(cv2.CAP_PROP_POS_MSEC, pos * 1000)
             if not args.silent:
-                #print('\b' * len(msg) + '\x1B[K', end='')
                 if not msg == '[{0}%]'.format(int(100 * pos / metadata['duration'])):
                     msg = '[{0}%]'.format(int(100 * pos / metadata['duration']))
-                    print(msg, end='', flush=True)
+                    # Update Progress Bar
+                    printProgressBar(int(100 * pos / metadata['duration'])+1, 100, prefix = 'Progress:', suffix = '', length = 100)
             img_count += 1
             success,img = vcap.read()
             if success:
@@ -73,7 +98,6 @@ def extract_images(metadata, directory, args):
                     print('could not finish generating bif file.')
                 exit(1)
         if not args.silent:
-            #print('\b' * len(msg) + '\x1B[K', end='')
             print('done ({0} images)'.format(img_count))
 
 def assemble_bif(output_location, img_directory, args):
@@ -95,12 +119,14 @@ def assemble_bif(output_location, img_directory, args):
 
         total_size = 8 * (len(images) + 1)
         index = 64 + total_size
-
+        # Initial call to print 0% progress
+        printProgressBar(0, 100, prefix = 'Progress:', suffix = '', length = 100)
         for n in range(len(images)):
             if not args.silent:
-                #print('\b' * len(msg) + '\x1B[K', end='')
-                msg = '[{0}%]'.format(int(50 * n / len(images)))
-                print(msg, end='', flush=True)
+                if not msg == '[{0}%]'.format(int(50 * n / len(images))):
+                    msg = '[{0}%]'.format(int(50 * n / len(images)))
+                    # Update Progress Bar
+                    printProgressBar(int(50 * n / len(images))+1, 100, prefix = 'Progress:', suffix = '', length = 100)
 
             image = images[n]
             f.write(struct.pack('<I', n))
@@ -110,17 +136,19 @@ def assemble_bif(output_location, img_directory, args):
         f.write(struct.pack('<I', 0xffffffff))
         f.write(struct.pack('<I', index))
 
+        # Initial call to print 0% progress
+        printProgressBar(0, 100, prefix = 'Progress:', suffix = '', length = 100)
         for n in range(len(images)):
             if not args.silent:
-                #print('\b' * len(msg) + '\x1B[K', end='')
-                msg = '[{0}%]'.format(50 + int(50 * n / len(images)))
-                print(msg, end='', flush=True)
+                if not msg == '[{0}%]'.format(50 + int(50 * n / len(images))):
+                    msg = '[{0}%]'.format(50 + int(50 * n / len(images)))
+                    # Update Progress Bar
+                    printProgressBar(50 + int(50 * n / len(images))+1, 100, prefix = 'Progress:', suffix = '', length = 100)
 
             data = open(os.path.join(img_directory, images[n]), 'rb').read()
             f.write(data)
 
         if not args.silent:
-            #print('\b' * len(msg) + '\x1B[K', end='')
             print('done\n')
 
 parser = ArgumentParser(description='''generate bif files in order to enable/support
