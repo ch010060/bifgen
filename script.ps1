@@ -11,13 +11,13 @@ foreach ($file in $files)
     echo "($counter/$totalNum) $filenameFull"
 
     # Skip bif generation of noninitial part file.
-    if(-not($filenameBase -match '.*-[cC][dD][2-9]')){
+    if(-not($filenameBase -match '.*-[cC][dD]([2-9]|[1-9][0-9])')){
         # Skip bif generation if bif file does exist.
-        if(Test-Path -Path $BIF_PATH -PathType Leaf){
+        if(Test-Path -Path "$BIF_PATH" -PathType Leaf){
             echo "BIF file does exist, skip !"
         }
         else {
-            python3 bifgen.py -o $BIF_PATH "${filenameFull}"
+            python3 bifgen.py -o "$BIF_PATH" "${filenameFull}"
         }
     }
     else{
