@@ -65,7 +65,7 @@ def get_metadata(filepath):
     return (False, metadata)
 
 def extract_images(metadata, directory, args):
-    vcap = cv2.VideoCapture(args.filepath)
+    vcap = cv2.VideoCapture(args.filepath, cv2.CAP_FFMPEG)
     if vcap.isOpened():
         # start at [offset] seconds & go to [duration] seconds
         # via [interval] second `skips', saving an image of the
@@ -89,7 +89,7 @@ def extract_images(metadata, directory, args):
             if success:
                 img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                 img = Image.fromarray(img)
-                img = img.resize(modes[args.mode], Image.ANTIALIAS)
+                img = img.resize(modes[args.mode], Image.LANCZOS)
                 filename = (8 - len(str(img_count))) * '0' + str(img_count) + '.jpg'
                 img.save(os.path.join(directory, filename))
             else:
