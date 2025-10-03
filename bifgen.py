@@ -3,8 +3,6 @@ import os
 import sys
 import struct
 import array
-import shutil
-import tempfile
 import cv2
 import multiprocessing
 from argparse import ArgumentParser
