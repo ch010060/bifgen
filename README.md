@@ -2,7 +2,7 @@
 generate bif files for roku devices in python without piping out to shell commands.
 
 ### usage:
-`bifgen [-h] [-i | --interval N] [-O | --offset N] [-o | --out FILE] [--sd] [-s | --silent] sourcevid`
+`bifgen [-h] [-i N] [-O N] [-o FILE] [--sd] [-s] [-j N] [--hwaccel HWACCEL] [--preset PRESET] sourcevid`
 
 #### positional arguments
 | argument               |                                               description |
@@ -18,5 +18,8 @@ generate bif files for roku devices in python without piping out to shell comman
 | `-o FILE`, `--out FILE`|          destination path/file where result will be saved |
 | `--sd`                 |               resulting bif file will be sd instead of hd |
 | `-s`, `--silent`       | do not print progress or diagnostic information to stdout |
+| `-j N`, `--jobs N`     |    Number of parallel jobs to run (defaults to core count) |
+| `--hwaccel HWACCEL`    |   Hardware acceleration to use (default: auto). Options: auto, cuda, videotoolbox, none |
+| `--preset PRESET`      |   Speed vs quality preset (default: medium). Options: fast, medium, quality |
 
 
