@@ -8,7 +8,6 @@ import tempfile
 import cv2
 import multiprocessing
 from argparse import ArgumentParser
-from PIL import Image
 from tqdm import tqdm
 
 modes = {'sd': (240, 136), 'hd': (320, 180)}
@@ -38,14 +37,9 @@ def get_metadata(filepath, args):
 
 def process_frame(frame_data):
     timestamp, frame_bgr, target_size = frame_data
-    img = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-    img = Image.fromarray(img)
-    img = img.resize(target_size, Image.LANCZOS)
-    
-    import io
-    buf = io.BytesIO()
-    img.save(buf, format='JPEG')
-    return (timestamp, buf.getvalue())
+    resized_frame = cv2.resize(frame_bgr, target_size, interpolation=cv2.INTER_LANCZOS4)
+    _success, encoded_image = cv2.imencode('.jpg', resized_frame)
+    return (timestamp, encoded_image.tobytes())
 
 def extract_images(metadata, args):
     options = {}
