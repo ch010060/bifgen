@@ -6,109 +6,88 @@ import array
 import shutil
 import tempfile
 import cv2
+import multiprocessing
 from argparse import ArgumentParser
 from PIL import Image
+from tqdm import tqdm
 
-modes = {'sd': (240,136), 'hd': (320,180)}
+modes = {'sd': (240, 136), 'hd': (320, 180)}
 
-# Print iterations progress
-def printProgressBar (iteration, total, prefix = '', suffix = '', decimals = 1, length = 100, fill = '█', printEnd = "\r"):
-    """
-    Call in a loop to create terminal progress bar
-    @params:
-        iteration   - Required  : current iteration (Int)
-        total       - Required  : total iterations (Int)
-        prefix      - Optional  : prefix string (Str)
-        suffix      - Optional  : suffix string (Str)
-        decimals    - Optional  : positive number of decimals in percent complete (Int)
-        length      - Optional  : character length of bar (Int)
-        fill        - Optional  : bar fill character (Str)
-        printEnd    - Optional  : end character (e.g. "\r", "\r\n") (Str)
-    """
-    percent = ("{0:." + str(decimals) + "f}").format(100 * (iteration / float(total)))
-    filledLength = int(length * iteration // total)
-    bar = fill * filledLength + '-' * (length - filledLength)
-    print(f'\r{prefix} |{bar}| {percent}% {suffix}', end = printEnd)
-    sys.stdout.flush()
-    # Print New Line on Complete
-    if iteration == total: 
-        print()
-
-def human_duration(t):
-    dur = []
-    while t and len(dur) < 3:
-        dur.append(t % 60)
-        t = t//60
-    if len(dur) == 1: dur.append(0)
-    dur.reverse()
-    return ':'.join([str(dur[0])] + ['0' * (2 - len(str(n))) + str(n) for n in dur[1:]])
-
-def greatest_common_denom(a, b):
-    while b:
-        a, b = b, a % b
-    return a
-
-def get_metadata(filepath):
+def get_metadata(filepath, args):
     metadata = {}
     if os.path.isfile(filepath):
-        vcap = cv2.VideoCapture(filepath)
+        options = {}
+        if args.hwaccel == 'cuda':
+            vcap = cv2.VideoCapture(filepath, cv2.CAP_FFMPEG, options)
+        elif args.hwaccel == 'videotoolbox':
+            vcap = cv2.VideoCapture(filepath, cv2.CAP_AVFOUNDATION, options)
+        else:
+            vcap = cv2.VideoCapture(filepath)
+
         if vcap.isOpened():
             metadata['width'] = int(vcap.get(cv2.CAP_PROP_FRAME_WIDTH))
             metadata['height'] = int(vcap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             metadata['aspect'] = float(metadata['width'] / metadata['height'])
-            vcap.set(cv2.CAP_PROP_POS_AVI_RATIO,1)
             fps = vcap.get(cv2.CAP_PROP_FPS)
-            frame_count = vcap.get(cv2.CAP_PROP_FRAME_COUNT)
-            metadata['duration_ms'] = int(frame_count/fps)*1000
-            metadata['duration'] = int(frame_count/fps)
+            frame_count = int(vcap.get(cv2.CAP_PROP_FRAME_COUNT))
+            metadata['duration_ms'] = int(frame_count / fps) * 1000
+            metadata['duration'] = int(frame_count / fps)
+            vcap.release()
             return (True, metadata)
     return (False, metadata)
 
-def extract_images(metadata, directory, args):
-    vcap = cv2.VideoCapture(args.filepath, cv2.CAP_FFMPEG)
-    if vcap.isOpened():
-        # start at [offset] seconds & go to [duration] seconds
-        # via [interval] second `skips', saving an image of the
-        # proper size each time
-        img_count = 0
-        if not args.silent:
-            print('extracting images... ', end='', flush=True)
-            msg = ''
-        # Initial call to print 0% progress
-        printProgressBar(0, 100, prefix = 'Progress:', suffix = '', length = 100)
-        while (args.offset + (img_count * args.interval)) * 1000 < metadata['duration_ms']:
-            pos = args.offset + (img_count * args.interval)
-            vcap.set(cv2.CAP_PROP_POS_MSEC, pos * 1000)
-            if not args.silent:
-                if not msg == '[{0}%]'.format(int(100 * pos / metadata['duration'])):
-                    msg = '[{0}%]'.format(int(100 * pos / metadata['duration']))
-                    # Update Progress Bar
-                    printProgressBar(int(100 * pos / metadata['duration'])+1, 100, prefix = 'Progress:', suffix = '', length = 100)
-            img_count += 1
-            success,img = vcap.read()
-            if success:
-                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                img = Image.fromarray(img)
-                img = img.resize(modes[args.mode], Image.LANCZOS)
-                filename = (8 - len(str(img_count))) * '0' + str(img_count) + '.jpg'
-                img.save(os.path.join(directory, filename))
-            else:
-                if not args.silent:
-                    print('\r\x1B[Kerror capturing frame {0} (@{1}sec)!'.format(img_count, pos))
-                    print('could not finish generating bif file.')
-                exit(1)
-        if not args.silent:
-            print('done ({0} images)'.format(img_count))
+def process_frame(frame_data):
+    timestamp, frame_bgr, target_size = frame_data
+    img = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    img = Image.fromarray(img)
+    img = img.resize(target_size, Image.LANCZOS)
+    
+    import io
+    buf = io.BytesIO()
+    img.save(buf, format='JPEG')
+    return (timestamp, buf.getvalue())
 
-def assemble_bif(output_location, img_directory, args):
-    magic_number = [0x89,0x42,0x49,0x46,0x0d,0x0a,0x1a,0x0a]
+def extract_images(metadata, args):
+    options = {}
+    if args.hwaccel == 'cuda':
+        vcap = cv2.VideoCapture(args.filepath, cv2.CAP_FFMPEG, options)
+    elif args.hwaccel == 'videotoolbox':
+        vcap = cv2.VideoCapture(args.filepath, cv2.CAP_AVFOUNDATION, options)
+    else:
+        vcap = cv2.VideoCapture(args.filepath)
+
+    if not vcap.isOpened():
+        print(f"Error: Could not open video file: {args.filepath}", file=sys.stderr)
+        return []
+
+    frame_timestamps = range(args.offset, metadata['duration'], args.interval)
+    total_frames = len(frame_timestamps)
+    
+    frames_to_process = []
+    for i, ts in enumerate(frame_timestamps):
+        vcap.set(cv2.CAP_PROP_POS_MSEC, ts * 1000)
+        success, frame = vcap.read()
+        if success:
+            frames_to_process.append((ts, frame, modes[args.mode]))
+        else:
+            print(f"Warning: Could not read frame at {ts}s", file=sys.stderr)
+    
+    vcap.release()
+
+    images = []
+    with multiprocessing.Pool(processes=args.jobs) as pool:
+        with tqdm(total=len(frames_to_process), desc="Processing frames", unit="frame", disable=args.silent) as pbar:
+            for result in pool.imap_unordered(process_frame, frames_to_process):
+                images.append(result)
+                pbar.update()
+
+    images.sort(key=lambda x: x[0])
+    return [img_data for _, img_data in images]
+
+
+def assemble_bif(output_location, images, args):
+    magic_number = [0x89, 0x42, 0x49, 0x46, 0x0d, 0x0a, 0x1a, 0x0a]
     version = 0
-
-    if not args.silent:
-        print('assembling bif file... ', end='', flush=True)
-        msg=''
-    images = [image for image in os.listdir('{0}'.format(img_directory)) if os.path.splitext(image)[1] == '.jpg']
-    images.sort()
 
     with open(output_location, 'wb') as f:
         array.array('B', magic_number).tofile(f)
@@ -117,77 +96,73 @@ def assemble_bif(output_location, img_directory, args):
         f.write(struct.pack('<I', 1000 * args.interval))
         array.array('B', [0x00] * 44).tofile(f)
 
-        total_size = 8 * (len(images) + 1)
-        index = 64 + total_size
-        # Initial call to print 0% progress
-        printProgressBar(0, 100, prefix = 'Progress:', suffix = '', length = 100)
-        for n in range(len(images)):
-            if not args.silent:
-                if not msg == '[{0}%]'.format(int(50 * n / len(images))):
-                    msg = '[{0}%]'.format(int(50 * n / len(images)))
-                    # Update Progress Bar
-                    printProgressBar(int(50 * n / len(images))+1, 100, prefix = 'Progress:', suffix = '', length = 100)
+        bif_table_size = 8 * (len(images) + 1)
+        image_index_offset = 64 + bif_table_size
+        
+        image_offsets = []
+        current_offset = image_index_offset
+        for img_data in images:
+            image_offsets.append(current_offset)
+            current_offset += len(img_data)
 
-            image = images[n]
-            f.write(struct.pack('<I', n))
-            f.write(struct.pack('<I', index))
-            index += os.stat(os.path.join(img_directory, image)).st_size
+        for i, offset in enumerate(image_offsets):
+            f.write(struct.pack('<I', i))
+            f.write(struct.pack('<I', offset))
 
         f.write(struct.pack('<I', 0xffffffff))
-        f.write(struct.pack('<I', index))
+        f.write(struct.pack('<I', current_offset))
 
-        # Initial call to print 0% progress
-        printProgressBar(0, 100, prefix = 'Progress:', suffix = '', length = 100)
-        for n in range(len(images)):
-            if not args.silent:
-                if not msg == '[{0}%]'.format(50 + int(50 * n / len(images))):
-                    msg = '[{0}%]'.format(50 + int(50 * n / len(images)))
-                    # Update Progress Bar
-                    printProgressBar(50 + int(50 * n / len(images))+1, 100, prefix = 'Progress:', suffix = '', length = 100)
+        for img_data in images:
+            f.write(img_data)
 
-            data = open(os.path.join(img_directory, images[n]), 'rb').read()
-            f.write(data)
+    if not args.silent:
+        print(f"Successfully created BIF file: {output_location}")
 
-        if not args.silent:
-            print('done\n')
+def main():
+    parser = ArgumentParser(description='Generate BIF files for Roku trick-play thumbnails.')
+    parser.add_argument('filepath', metavar='sourcevid', type=str, help='Video file to process')
+    parser.add_argument('-i', '--interval', metavar='N', dest='interval', type=int, default=10,
+                        help='Interval between images in seconds (default: 10)')
+    parser.add_argument('-O', '--offset', metavar='N', dest='offset', type=int, default=0,
+                        help='Offset to first image in seconds (default: 0)')
+    parser.add_argument('-o', '--out', metavar='FILE', dest='output', type=str,
+                        help='Destination path/file for the BIF result')
+    parser.add_argument('--sd', dest='mode', action='store_const', const='sd', default='hd',
+                        help='Generate SD resolution BIF file (default: HD)')
+    parser.add_argument('-s', '--silent', dest='silent', action='store_true',
+                        help='Suppress progress and diagnostic information')
+    parser.add_argument('--hwaccel', type=str, default='auto', choices=['auto', 'cuda', 'videotoolbox', 'none'],
+                        help='Hardware acceleration to use (default: auto)')
+    parser.add_argument('-j', '--jobs', type=int, default=os.cpu_count(),
+                        help=f'Number of parallel jobs to run (default: {os.cpu_count()})')
 
-parser = ArgumentParser(description='''generate bif files in order to enable/support
-                        positional trickplay thumbnails on roku devices.''')
-parser.add_argument('filepath', metavar='sourcevid', type=str, help='video file to process')
-parser.add_argument('-i', '--interval', metavar='N', dest='interval', type=int, default=10,
-                    help='interval between images in seconds (10 by default)')
-parser.add_argument('-O', '--offset', metavar='N', dest='offset', type=int, default=0,
-                    help='offset to first image in seconds (0 by default)')
-parser.add_argument('-o', '--out', metavar='FILE', dest='output', type=str,
-                    help='destination path/file where result will be saved')
-parser.add_argument('--sd', dest='mode', action='store_const', const='sd', default='hd',
-                    help='resulting bif file will be sd instead of hd')
-parser.add_argument('-s', '--silent', dest='silent', action='store_const', const=True, default=False,
-                    help='do not print progress or diagnostic information to stdout')
+    args = parser.parse_args()
 
-args = parser.parse_args()
+    success, metadata = get_metadata(args.filepath, args)
+    if not success:
+        print('Error: Invalid or corrupt video file', file=sys.stderr)
+        sys.exit(1)
 
-success, metadata = get_metadata(args.filepath)
-print(metadata)
-if not success:
-    print('error: invalid or corrupt video file')
-    exit(1)
+    if not args.silent:
+        print(f"Source: {os.path.basename(args.filepath)} ({metadata['width']}x{metadata['height']}, duration: {metadata['duration']}s)")
 
-gcd=greatest_common_denom(metadata['width'], metadata['height'])
-if not args.silent: print('source: {0} (aspect ratio {1}:{2}, runtime {3})'.format(os.path.basename(args.filepath),
-                                                                                   int(metadata['width'] / gcd),
-                                                                                   int(metadata['height'] / gcd),
-                                                                                   human_duration(metadata['duration'])))
-width, height = modes[args.mode]
-width = int(metadata['aspect'] * height)
-modes[args.mode] = (width, height)
+    width, height = modes[args.mode]
+    if metadata['aspect'] > 1:
+        width = int(height * metadata['aspect'])
+    else:
+        width = int(height * metadata['aspect'])
+    modes[args.mode] = (width, height)
 
-temp_dest = tempfile.mkdtemp()
-extract_images(metadata, temp_dest, args)
-destination = args.output if args.output is not None else \
-    '{0}-{1}.bif'.format(os.path.splitext(os.path.basename(args.filepath))[0], args.mode.upper())
-assemble_bif(destination, temp_dest, args)
-shutil.rmtree(temp_dest)
-if not args.silent: print('result: ' + destination)
+    images = extract_images(metadata, args)
+    
+    if not images:
+        print("Error: No images were extracted. BIF file generation failed.", file=sys.stderr)
+        sys.exit(1)
 
-# vim:fdm=marker
+    destination = args.output if args.output is not None else \
+        f'{os.path.splitext(os.path.basename(args.filepath))[0]}-{args.mode.upper()}.bif'
+    
+    assemble_bif(destination, images, args)
+
+if __name__ == '__main__':
+    main()
