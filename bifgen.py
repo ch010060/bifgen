@@ -48,23 +48,35 @@ def init_worker(filepath, hwaccel):
 
 def process_frame(task):
     global vcap
-    timestamp, target_size = task
-    
+    timestamp, target_size, preset = task
+
+    # Map preset to interpolation algorithm and JPEG quality
+    if preset == 'fast':
+        interpolation = cv2.INTER_LINEAR
+        jpeg_quality = 80
+    elif preset == 'quality':
+        interpolation = cv2.INTER_LANCZOS4
+        jpeg_quality = 95
+    else:  # medium (default)
+        interpolation = cv2.INTER_AREA
+        jpeg_quality = 90
+
     vcap.set(cv2.CAP_PROP_POS_MSEC, timestamp * 1000)
     success, frame_bgr = vcap.read()
-    
+
     if not success:
         print(f"Warning: Could not read frame at {timestamp}s", file=sys.stderr)
         return None
-        
-    resized_frame = cv2.resize(frame_bgr, target_size, interpolation=cv2.INTER_LANCZOS4)
-    _success, encoded_image = cv2.imencode('.jpg', resized_frame)
+
+    resized_frame = cv2.resize(frame_bgr, target_size, interpolation=interpolation)
+    encode_params = [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality]
+    _success, encoded_image = cv2.imencode('.jpg', resized_frame, encode_params)
     return (timestamp, encoded_image.tobytes())
 
 def extract_images(metadata, args):
     frame_timestamps = range(args.offset, metadata['duration'], args.interval)
-    tasks = [(ts, modes[args.mode]) for ts in frame_timestamps]
-    
+    tasks = [(ts, modes[args.mode], args.preset) for ts in frame_timestamps]
+
     images = []
     # initializer and initargs are used to create a per-process VideoCapture object
     # to avoid opening the file for every frame.
@@ -92,7 +104,7 @@ def assemble_bif(output_location, images, args):
 
         bif_table_size = 8 * (len(images) + 1)
         image_index_offset = 64 + bif_table_size
-        
+
         image_offsets = []
         current_offset = image_index_offset
         for img_data in images:
@@ -129,7 +141,8 @@ def main():
                         help='Hardware acceleration to use (default: auto)')
     parser.add_argument('-j', '--jobs', type=int, default=os.cpu_count(),
                         help=f'Number of parallel jobs to run (default: {os.cpu_count()})')
-
+    parser.add_argument('--preset', type=str, default='medium', choices=['fast', 'medium', 'quality'],
+                        help='Adjust for speed vs quality. (default: medium)')
     args = parser.parse_args()
 
     success, metadata = get_metadata(args.filepath, args)
