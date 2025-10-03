@@ -13,11 +13,10 @@ modes = {'sd': (240, 136), 'hd': (320, 180)}
 def get_metadata(filepath, args):
     metadata = {}
     if os.path.isfile(filepath):
-        options = {}
         if args.hwaccel == 'cuda':
-            vcap = cv2.VideoCapture(filepath, cv2.CAP_FFMPEG, options)
+            vcap = cv2.VideoCapture(filepath, cv2.CAP_FFMPEG)
         elif args.hwaccel == 'videotoolbox':
-            vcap = cv2.VideoCapture(filepath, cv2.CAP_AVFOUNDATION, options)
+            vcap = cv2.VideoCapture(filepath, cv2.CAP_AVFOUNDATION)
         else:
             vcap = cv2.VideoCapture(filepath)
 
