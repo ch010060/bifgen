@@ -35,44 +35,44 @@ def get_metadata(filepath, args):
             return (True, metadata)
     return (False, metadata)
 
-def process_frame(frame_data):
-    timestamp, frame_bgr, target_size = frame_data
+# Worker initializer to create a global VideoCapture object per worker process
+vcap = None
+def init_worker(filepath, hwaccel):
+    global vcap
+    if hwaccel == 'cuda':
+        vcap = cv2.VideoCapture(filepath, cv2.CAP_FFMPEG)
+    elif hwaccel == 'videotoolbox':
+        vcap = cv2.VideoCapture(filepath, cv2.CAP_AVFOUNDATION)
+    else:
+        vcap = cv2.VideoCapture(filepath)
+
+def process_frame(task):
+    global vcap
+    timestamp, target_size = task
+    
+    vcap.set(cv2.CAP_PROP_POS_MSEC, timestamp * 1000)
+    success, frame_bgr = vcap.read()
+    
+    if not success:
+        print(f"Warning: Could not read frame at {timestamp}s", file=sys.stderr)
+        return None
+        
     resized_frame = cv2.resize(frame_bgr, target_size, interpolation=cv2.INTER_LANCZOS4)
     _success, encoded_image = cv2.imencode('.jpg', resized_frame)
     return (timestamp, encoded_image.tobytes())
 
 def extract_images(metadata, args):
-    options = {}
-    if args.hwaccel == 'cuda':
-        vcap = cv2.VideoCapture(args.filepath, cv2.CAP_FFMPEG, options)
-    elif args.hwaccel == 'videotoolbox':
-        vcap = cv2.VideoCapture(args.filepath, cv2.CAP_AVFOUNDATION, options)
-    else:
-        vcap = cv2.VideoCapture(args.filepath)
-
-    if not vcap.isOpened():
-        print(f"Error: Could not open video file: {args.filepath}", file=sys.stderr)
-        return []
-
     frame_timestamps = range(args.offset, metadata['duration'], args.interval)
-    total_frames = len(frame_timestamps)
+    tasks = [(ts, modes[args.mode]) for ts in frame_timestamps]
     
-    frames_to_process = []
-    for i, ts in enumerate(frame_timestamps):
-        vcap.set(cv2.CAP_PROP_POS_MSEC, ts * 1000)
-        success, frame = vcap.read()
-        if success:
-            frames_to_process.append((ts, frame, modes[args.mode]))
-        else:
-            print(f"Warning: Could not read frame at {ts}s", file=sys.stderr)
-    
-    vcap.release()
-
     images = []
-    with multiprocessing.Pool(processes=args.jobs) as pool:
-        with tqdm(total=len(frames_to_process), desc="Processing frames", unit="frame", disable=args.silent) as pbar:
-            for result in pool.imap_unordered(process_frame, frames_to_process):
-                images.append(result)
+    # initializer and initargs are used to create a per-process VideoCapture object
+    # to avoid opening the file for every frame.
+    with multiprocessing.Pool(processes=args.jobs, initializer=init_worker, initargs=(args.filepath, args.hwaccel)) as pool:
+        with tqdm(total=len(tasks), desc="Processing frames", unit="frame", disable=args.silent) as pbar:
+            for result in pool.imap_unordered(process_frame, tasks):
+                if result is not None:
+                    images.append(result)
                 pbar.update()
 
     images.sort(key=lambda x: x[0])
