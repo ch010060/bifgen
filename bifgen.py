@@ -78,8 +78,14 @@ def extract_images(metadata, args):
     # initializer and initargs are used to create a per-process VideoCapture object
     # to avoid opening the file for every frame.
     with multiprocessing.Pool(processes=args.jobs, initializer=init_worker, initargs=(args.filepath, args.hwaccel)) as pool:
+        # Calculate chunksize to balance parallel processing with sequential file access
+        num_processes = pool._processes or 1  # Fallback for unusual pool configurations
+        chunksize, extra = divmod(len(tasks), num_processes * 4)
+        if extra:
+            chunksize += 1
+        
         with tqdm(total=len(tasks), desc="Processing frames", unit="frame", disable=args.silent) as pbar:
-            for result in pool.imap_unordered(process_frame, tasks):
+            for result in pool.imap_unordered(process_frame, tasks, chunksize=chunksize):
                 if result is not None:
                     images.append(result)
                 pbar.update()
