@@ -32,20 +32,13 @@ def get_metadata(filepath, args):
             return (True, metadata)
     return (False, metadata)
 
-# Worker initializer to create a global VideoCapture object per worker process
-vcap = None
-def init_worker(filepath, hwaccel):
-    global vcap
-    if hwaccel == 'cuda':
-        vcap = cv2.VideoCapture(filepath, cv2.CAP_FFMPEG)
-    elif hwaccel == 'videotoolbox':
-        vcap = cv2.VideoCapture(filepath, cv2.CAP_AVFOUNDATION)
-    else:
-        vcap = cv2.VideoCapture(filepath)
-
 def process_frame(task):
-    global vcap
-    timestamp, target_size, preset = task
+    """
+    Processes a single frame: opens the video, seeks, reads, resizes, and encodes.
+    This function is designed to be self-contained for robust multiprocessing.
+    """
+    # Unpack all task parameters
+    filepath, hwaccel, timestamp, target_size, preset, use_opencl = task
 
     # Map preset to interpolation algorithm and JPEG quality
     if preset == 'fast':
@@ -58,28 +51,71 @@ def process_frame(task):
         interpolation = cv2.INTER_AREA
         jpeg_quality = 90
 
-    vcap.set(cv2.CAP_PROP_POS_MSEC, timestamp * 1000)
-    success, frame_bgr = vcap.read()
+    vcap = None
+    try:
+        # Create VideoCapture object inside the worker function for stability
+        if hwaccel in ('videotoolbox', 'auto') and sys.platform == 'darwin':
+            vcap = cv2.VideoCapture(filepath, cv2.CAP_AVFOUNDATION)
+        elif hwaccel == 'cuda':
+            vcap = cv2.VideoCapture(filepath, cv2.CAP_FFMPEG)
+        else:
+            vcap = cv2.VideoCapture(filepath)
 
-    if not success:
-        print(f"Warning: Could not read frame at {timestamp}s", file=sys.stderr)
-        return None
+        if not vcap.isOpened():
+            print(f"Warning: Could not open video file in worker for timestamp {timestamp}s", file=sys.stderr)
+            return None
 
-    resized_frame = cv2.resize(frame_bgr, target_size, interpolation=interpolation)
-    encode_params = [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality]
-    _success, encoded_image = cv2.imencode('.jpg', resized_frame, encode_params)
-    return (timestamp, encoded_image.tobytes())
+        vcap.set(cv2.CAP_PROP_POS_MSEC, timestamp * 1000)
+        success, frame_bgr = vcap.read()
+
+        if not success:
+            # Don't print warning if it's just the end of the video
+            if timestamp < (vcap.get(cv2.CAP_PROP_FRAME_COUNT) / vcap.get(cv2.CAP_PROP_FPS)) - 1:
+                 print(f"Warning: Could not read frame at {timestamp}s", file=sys.stderr)
+            return None
+
+        # Decide whether to use GPU (UMat) or CPU path for resizing
+        if use_opencl:
+            try:
+                frame_umat = cv2.UMat(frame_bgr)
+                resized_umat = cv2.resize(frame_umat, target_size, interpolation=interpolation)
+                resized_frame = resized_umat.get()
+            except cv2.error:
+                # Fallback to CPU for this frame in case of a specific GPU error
+                resized_frame = cv2.resize(frame_bgr, target_size, interpolation=interpolation)
+        else:
+            # CPU Path (original behavior)
+            resized_frame = cv2.resize(frame_bgr, target_size, interpolation=interpolation)
+
+        encode_params = [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality]
+        _success, encoded_image = cv2.imencode('.jpg', resized_frame, encode_params)
+        return (timestamp, encoded_image.tobytes())
+
+    finally:
+        if vcap is not None:
+            vcap.release()
+
 
 def extract_images(metadata, args):
     frame_timestamps = range(args.offset, metadata['duration'], args.interval)
-    tasks = [(ts, modes[args.mode], args.preset) for ts in frame_timestamps]
+
+    # Check for OpenCL support once in the main process
+    use_opencl = False
+    if cv2.ocl.haveOpenCL():
+        cv2.ocl.setUseOpenCL(True)
+        if cv2.ocl.useOpenCL():
+            use_opencl = True
+            if not args.silent:
+                print("OpenCL (GPU) acceleration for resizing is enabled.")
+
+    # Each task now contains all the information needed to be self-contained
+    tasks = [(args.filepath, args.hwaccel, ts, modes[args.mode], args.preset, use_opencl) for ts in frame_timestamps]
 
     images = []
-    # initializer and initargs are used to create a per-process VideoCapture object
-    # to avoid opening the file for every frame.
-    with multiprocessing.Pool(processes=args.jobs, initializer=init_worker, initargs=(args.filepath, args.hwaccel)) as pool:
+    # The pool no longer needs an initializer, making it simpler and more robust.
+    with multiprocessing.Pool(processes=args.jobs) as pool:
         # Calculate chunksize to balance parallel processing with sequential file access
-        num_processes = pool._processes or 1  # Fallback for unusual pool configurations
+        num_processes = pool._processes or 1
         chunksize, extra = divmod(len(tasks), num_processes * 4)
         if extra:
             chunksize += 1
