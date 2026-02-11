@@ -5,6 +5,11 @@ import struct
 import array
 import cv2
 import multiprocessing
+import shutil
+import subprocess
+import tempfile
+import glob
+import json
 from argparse import ArgumentParser
 from tqdm import tqdm
 
@@ -13,6 +18,7 @@ modes = {'sd': (240, 136), 'hd': (320, 180)}
 def get_metadata(filepath, args):
     metadata = {}
     if os.path.isfile(filepath):
+        # Try OpenCV first (preserves original behavior)
         if args.hwaccel == 'cuda':
             vcap = cv2.VideoCapture(filepath, cv2.CAP_FFMPEG)
         elif args.hwaccel == 'videotoolbox':
@@ -23,22 +29,35 @@ def get_metadata(filepath, args):
         if vcap.isOpened():
             metadata['width'] = int(vcap.get(cv2.CAP_PROP_FRAME_WIDTH))
             metadata['height'] = int(vcap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            metadata['aspect'] = float(metadata['width'] / metadata['height'])
-            fps = vcap.get(cv2.CAP_PROP_FPS)
-            frame_count = int(vcap.get(cv2.CAP_PROP_FRAME_COUNT))
-            metadata['duration_ms'] = int(frame_count / fps) * 1000
-            metadata['duration'] = int(frame_count / fps)
+            metadata['aspect'] = float(metadata['width'] / metadata['height']) if metadata['height'] else 0.0
+            fps = float(vcap.get(cv2.CAP_PROP_FPS) or 0.0)
+            frame_count = int(vcap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            duration = (frame_count / fps) if (fps > 0 and frame_count > 0) else 0.0
+            metadata['duration_ms'] = int(duration * 1000.0)
+            metadata['duration'] = int(duration)
             vcap.release()
             return (True, metadata)
+
+        # Fallback: probe via ffprobe if available to validate the file and get metadata
+        ok, md = _ffprobe_metadata(filepath)
+        if ok:
+            return (True, md)
     return (False, metadata)
 
+# Worker initializer to create a global VideoCapture object per worker process
+vcap = None
+def init_worker(filepath, hwaccel):
+    global vcap
+    if hwaccel == 'cuda':
+        vcap = cv2.VideoCapture(filepath, cv2.CAP_FFMPEG)
+    elif hwaccel == 'videotoolbox':
+        vcap = cv2.VideoCapture(filepath, cv2.CAP_AVFOUNDATION)
+    else:
+        vcap = cv2.VideoCapture(filepath)
+
 def process_frame(task):
-    """
-    Processes a single frame: opens the video, seeks, reads, resizes, and encodes.
-    This function is designed to be self-contained for robust multiprocessing.
-    """
-    # Unpack all task parameters
-    filepath, hwaccel, timestamp, target_size, preset, use_opencl = task
+    global vcap
+    timestamp, target_size, preset = task
 
     # Map preset to interpolation algorithm and JPEG quality
     if preset == 'fast':
@@ -51,71 +70,45 @@ def process_frame(task):
         interpolation = cv2.INTER_AREA
         jpeg_quality = 90
 
-    vcap = None
-    try:
-        # Create VideoCapture object inside the worker function for stability
-        if hwaccel in ('videotoolbox', 'auto') and sys.platform == 'darwin':
-            vcap = cv2.VideoCapture(filepath, cv2.CAP_AVFOUNDATION)
-        elif hwaccel == 'cuda':
-            vcap = cv2.VideoCapture(filepath, cv2.CAP_FFMPEG)
-        else:
-            vcap = cv2.VideoCapture(filepath)
+    vcap.set(cv2.CAP_PROP_POS_MSEC, timestamp * 1000)
+    success, frame_bgr = vcap.read()
 
-        if not vcap.isOpened():
-            print(f"Warning: Could not open video file in worker for timestamp {timestamp}s", file=sys.stderr)
-            return None
+    if not success:
+        print(f"Warning: Could not read frame at {timestamp}s", file=sys.stderr)
+        return None
 
-        vcap.set(cv2.CAP_PROP_POS_MSEC, timestamp * 1000)
-        success, frame_bgr = vcap.read()
-
-        if not success:
-            # Don't print warning if it's just the end of the video
-            if timestamp < (vcap.get(cv2.CAP_PROP_FRAME_COUNT) / vcap.get(cv2.CAP_PROP_FPS)) - 1:
-                 print(f"Warning: Could not read frame at {timestamp}s", file=sys.stderr)
-            return None
-
-        # Decide whether to use GPU (UMat) or CPU path for resizing
-        if use_opencl:
-            try:
-                frame_umat = cv2.UMat(frame_bgr)
-                resized_umat = cv2.resize(frame_umat, target_size, interpolation=interpolation)
-                resized_frame = resized_umat.get()
-            except cv2.error:
-                # Fallback to CPU for this frame in case of a specific GPU error
-                resized_frame = cv2.resize(frame_bgr, target_size, interpolation=interpolation)
-        else:
-            # CPU Path (original behavior)
-            resized_frame = cv2.resize(frame_bgr, target_size, interpolation=interpolation)
-
-        encode_params = [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality]
-        _success, encoded_image = cv2.imencode('.jpg', resized_frame, encode_params)
-        return (timestamp, encoded_image.tobytes())
-
-    finally:
-        if vcap is not None:
-            vcap.release()
-
+    resized_frame = cv2.resize(frame_bgr, target_size, interpolation=interpolation)
+    encode_params = [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality]
+    _success, encoded_image = cv2.imencode('.jpg', resized_frame, encode_params)
+    return (timestamp, encoded_image.tobytes())
 
 def extract_images(metadata, args):
-    frame_timestamps = range(args.offset, metadata['duration'], args.interval)
-
-    # Check for OpenCL support once in the main process
-    use_opencl = False
-    if cv2.ocl.haveOpenCL():
-        cv2.ocl.setUseOpenCL(True)
-        if cv2.ocl.useOpenCL():
-            use_opencl = True
+    # Quick pre-check: if OpenCV can't open with the selected backend, use FFmpeg fallback
+    pre_vcap = None
+    try:
+        if args.hwaccel == 'cuda':
+            pre_vcap = cv2.VideoCapture(args.filepath, cv2.CAP_FFMPEG)
+        elif args.hwaccel == 'videotoolbox':
+            pre_vcap = cv2.VideoCapture(args.filepath, cv2.CAP_AVFOUNDATION)
+        else:
+            pre_vcap = cv2.VideoCapture(args.filepath)
+        if not pre_vcap.isOpened():
             if not args.silent:
-                print("OpenCL (GPU) acceleration for resizing is enabled.")
+                print('Primary backend failed to open. Falling back to FFmpeg extraction...', file=sys.stderr)
+            return extract_images_ffmpeg(metadata, args)
+    finally:
+        if pre_vcap is not None:
+            pre_vcap.release()
 
-    # Each task now contains all the information needed to be self-contained
-    tasks = [(args.filepath, args.hwaccel, ts, modes[args.mode], args.preset, use_opencl) for ts in frame_timestamps]
+    frame_timestamps = range(args.offset, metadata['duration'], args.interval)
+    tasks = [(ts, modes[args.mode], args.preset) for ts in frame_timestamps]
 
     images = []
-    # The pool no longer needs an initializer, making it simpler and more robust.
-    with multiprocessing.Pool(processes=args.jobs) as pool:
+    # initializer and initargs are used to create a per-process VideoCapture object
+    # to avoid opening the file for every frame.
+    with multiprocessing.Pool(processes=args.jobs, initializer=init_worker, initargs=(args.filepath, args.hwaccel)) as pool:
         # Calculate chunksize to balance parallel processing with sequential file access
-        num_processes = pool._processes or 1
+        num_processes = pool._processes or 1  # Fallback for unusual pool configurations
         chunksize, extra = divmod(len(tasks), num_processes * 4)
         if extra:
             chunksize += 1
@@ -126,8 +119,134 @@ def extract_images(metadata, args):
                     images.append(result)
                 pbar.update()
 
+    if not images:
+        # If OpenCV path produced no images, fallback to FFmpeg extraction
+        if not args.silent:
+            print('No frames via OpenCV; falling back to FFmpeg extraction...', file=sys.stderr)
+        return extract_images_ffmpeg(metadata, args)
+
     images.sort(key=lambda x: x[0])
     return [img_data for _, img_data in images]
+
+def _ffprobe_metadata(filepath):
+    if not shutil.which('ffprobe'):
+        return (False, {})
+    try:
+        cmd = [
+            'ffprobe', '-v', 'error',
+            '-select_streams', 'v:0',
+            '-show_entries', 'stream=width,height,avg_frame_rate',
+            '-show_entries', 'format=duration',
+            '-of', 'json',
+            filepath
+        ]
+        out = subprocess.check_output(cmd)
+        info = json.loads(out.decode('utf-8', errors='ignore'))
+        streams = info.get('streams', [])
+        fmt = info.get('format', {})
+        if not streams:
+            return (False, {})
+        s = streams[0]
+        width = int(s.get('width') or 0)
+        height = int(s.get('height') or 0)
+        fr_str = s.get('avg_frame_rate') or '0/1'
+        try:
+            num, den = fr_str.split('/')
+            fps = float(num) / float(den) if float(den) != 0 else 0.0
+        except Exception:
+            fps = 0.0
+        try:
+            duration = float(fmt.get('duration') or 0.0)
+        except Exception:
+            duration = 0.0
+        if width <= 0 or height <= 0 or duration <= 0:
+            return (False, {})
+        metadata = {
+            'width': width,
+            'height': height,
+            'aspect': float(width / height) if height else 0.0,
+            'duration_ms': int(duration * 1000.0),
+            'duration': int(duration),
+            'fps': fps,
+        }
+        return (True, metadata)
+    except Exception:
+        return (False, {})
+
+def _ffmpeg_qscale(preset: str):
+    # Lower is better quality; keep filesize reasonable
+    if preset == 'fast':
+        return 6
+    if preset == 'quality':
+        return 2
+    return 4
+
+def extract_images_ffmpeg(metadata, args):
+    if not shutil.which('ffmpeg'):
+        if not args.silent:
+            print('FFmpeg not found in PATH; cannot fallback to FFmpeg extraction.', file=sys.stderr)
+        return []
+
+    width, height = modes[args.mode]
+    interval = max(1, int(args.interval))
+    qscale = _ffmpeg_qscale(args.preset)
+
+    images = []
+    with tempfile.TemporaryDirectory(prefix='bif_frames_') as tmpdir:
+        out_pattern = os.path.join(tmpdir, '%08d.jpg')
+        cmd = ['ffmpeg', '-hide_banner', '-nostdin', '-loglevel', 'error', '-threads', '0']
+        if args.offset:
+            cmd += ['-ss', str(args.offset)]
+        cmd += ['-i', args.filepath,
+                '-map', '0:v:0', '-an', '-sn', '-dn',
+                '-vf', f'fps=1/{interval}', '-s', f'{width}x{height}',
+                '-qscale:v', str(qscale),
+                # Request machine-readable progress and write sequential JPEGs
+                '-progress', 'pipe:1',
+                '-y', out_pattern]
+
+        # Estimate expected images for a smoother progress bar
+        expected = max(0, int(max(0, metadata.get('duration', 0) - int(args.offset)) / interval))
+
+        try:
+            last_count = 0
+            with tqdm(total=expected, desc='Extracting', unit='img', disable=args.silent) as pbar:
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
+                if proc.stdout is not None:
+                    for _ in proc.stdout:
+                        try:
+                            count = len(glob.glob(os.path.join(tmpdir, '*.jpg')))
+                            if count > expected:
+                                count = expected
+                            if count > last_count:
+                                pbar.update(count - last_count)
+                                last_count = count
+                        except Exception:
+                            pass
+                ret = proc.wait()
+                # Final sync to actual files produced
+                try:
+                    final_count = len(glob.glob(os.path.join(tmpdir, '*.jpg')))
+                    if final_count > expected:
+                        final_count = expected
+                    if final_count > last_count:
+                        pbar.update(final_count - last_count)
+                        last_count = final_count
+                except Exception:
+                    pass
+            if ret != 0:
+                raise subprocess.CalledProcessError(ret, cmd)
+        except subprocess.CalledProcessError:
+            if not args.silent:
+                print('FFmpeg extraction failed.', file=sys.stderr)
+            return []
+
+        # Collect frames in order
+        for fname in sorted(glob.glob(os.path.join(tmpdir, '*.jpg'))):
+            with open(fname, 'rb') as fp:
+                images.append(fp.read())
+
+    return images
 
 
 def assemble_bif(output_location, images, args):
